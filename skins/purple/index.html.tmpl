@@ -15,6 +15,7 @@
 #import bisect
 #import math
 #import time
+#from user.purple import past_spans
 ##
 ## Never read a #set variable inside a comprehension, generator expression or
 ## lambda, except as a comprehension's first iterable.  Cheetah finds a
@@ -58,8 +59,13 @@
 #else
 #set $heading = $gettext("Air Quality")
 #end if
+## $lang is the lang option as written, less (from WeeWX 5.1) any country:
+## a locale spec such as de.UTF-8, de@euro, or before 5.1 de_DE.UTF-8, would
+## reach the page as an invalid BCP 47 tag.  Keep only the language, from a
+## spec of the form language[_territory][.codeset][@modifier].
+#set $html_lang = $lang.split('@')[0].split('.')[0].split('_')[0]
 <!DOCTYPE html>
-<html lang="$lang">
+<html lang="$html_lang">
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -247,17 +253,26 @@
 #set $peak_swatch = '#%06x' % int($day.pm2_5_aqi_color.max.raw)
 #set $mean_swatch = '#%06x' % int($day.pm2_5_aqi_color.avg.raw)
 #set $low_swatch  = '#%06x' % int($day.pm2_5_aqi_color.min.raw)
-## Two series over the same trailing day: the colors paint the cells, the
-## AQIs supply the count and the per-cell tooltip.  Averaging a color is
-## meaningful here only because the xtype averages the underlying pm2_5 and
-## colors THAT -- see AQI.get_aggregate.  ArchiveTable.get_series skips the
-## buckets that fall outside the archive's own span, so this can come back
-## with fewer than 24 entries, or none at all; everything downstream of it
-## is guarded on $stops rather than assuming 24.
-#set $strip_colors = $span($hour_delta=24).pm2_5_aqi_color.series(aggregate_type='avg', aggregate_interval=3600)
-#set $strip_aqis = $span($hour_delta=24).pm2_5_aqi.series(aggregate_type='avg', aggregate_interval=3600)
-#set $stops = $strip_colors.stop.raw
-#set $hourly = $strip_aqis.data.raw
+## The last 24 ELAPSED hours, one cell per real hour, from past_spans in
+## bin/user/purple.py.  WeeWX's own trailing spans and series buckets step
+## the wall clock, so across a clock change they gave 25 or 23 hours, a
+## two-hour cell, or (in the repeated hour) no newest hour at all.  For each
+## hour: the color paints the cell, and the AQI supplies the count and the
+## tooltip.  Averaging a color is meaningful here only because the xtype
+## averages the underlying pm2_5 and colors THAT (see AQI.get_aggregate).
+## Hours before the archive's first record are left out, so a young station
+## gets fewer than 24 cells or none; everything below is guarded on $stops
+## rather than assuming 24.  An hour with no data is None, a gray cell.
+## past_spans is called bare, not as $past_spans: written without
+## parentheses, the $ form is autocalled with no arguments and kills the page.
+#set $stops = []
+#set $hourly = []
+#set $colors = []
+#for $h in past_spans($day, $current.dateTime.raw, 24, 3600)
+#silent $stops.append($h.end.raw)
+#silent $hourly.append($h.pm2_5_aqi.avg.raw)
+#silent $colors.append($h.pm2_5_aqi_color.avg.raw)
+#end for
 #set $above = 0
 #for $v in $hourly
 #if $v is not None and $v > $aqi_tops[0]
@@ -265,7 +280,7 @@
 #end if
 #end for
 #set $cells = []
-#for $i, $c in enumerate($strip_colors.data.raw)
+#for $i, $c in enumerate($colors)
 #set $stamp = time.strftime('%H:%M', time.localtime($stops[$i]))
 #if $c is None or $hourly[$i] is None
 #silent $cells.append(('#e7ebef', $stamp))
@@ -273,10 +288,11 @@
 #silent $cells.append(('#%06x' % int($c), '%s: %d%s' % ($stamp, int($hourly[$i]), $unit.label.pm2_5_aqi)))
 #end if
 #end for
-## Four evenly spaced labels -- but de-duplicated, because a series with
-## fewer than four buckets (a station whose archive is an hour or two old)
-## would otherwise repeat one: two buckets give [0, 0, 1, 1], and the axis
-## reads 14:10 14:10 15:10 15:10.
+## Four evenly spaced labels -- but de-duplicated by index, because a strip
+## with fewer than four cells (a station whose archive is an hour or two
+## old) would otherwise repeat one: two cells give [0, 0, 1, 1], and the
+## axis reads 14:10 14:10 15:10 15:10.  Two DIFFERENT cells may still share a
+## label across a clock change (see past_spans), and both are shown.
 #set $axis = []
 #set $axis_seen = []
 #for $i in ([0, len($stops) // 3, 2 * len($stops) // 3, len($stops) - 1] if $stops else [])

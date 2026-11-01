@@ -6,15 +6,20 @@ fetch stack down is exercised with mocks, and the xtype SQL paths run
 against an in-memory SQLite database."""
 
 import ast
+import calendar
+import contextlib
 import datetime
+import html as html_module
 import importlib.util
 import io
 import logging
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -33,21 +38,52 @@ import weeutil.logger
 import weeutil.weeutil
 import weewx
 import weewx.accum
+import weewx.cheetahgenerator
+import weewx.manager
+import weewx.reportengine
+import weewx.station
+import weewx.tags
 import weewx.units
 import weewx.xtypes
 
 import user.purple
 
-from user.purple import AQI, Concentrations, Configuration, Purple, Source
+from user.purple import AQI, Concentrations, Configuration, Purple, Source, past_spans
 
 log = logging.getLogger(__name__)
 
 # Set up logging using the defaults.
 weeutil.logger.setup('test_config', {})
 
-# A class whose *name* matches weewxd's shutdown exception.  weewxd raises
-# Terminate from its SIGTERM handler; purple.py recognizes it by name.
-Terminate = type('Terminate', (Exception,), {})
+class Terminate(Exception):
+    """Stands in for weewxd's shutdown exception: installed as the running
+    weewxd's class for a test's duration by weewxd_running.  A service does
+    not import weewxd, and neither does its test."""
+
+class Impostor(Exception):
+    """Another module's class that happens to be called Terminate."""
+Impostor.__name__ = 'Terminate'
+
+@contextlib.contextmanager
+def weewxd_running(where='weewxd'):
+    """A weewxd whose Terminate is this file's, in sys.modules under
+    `where`: 'weewxd' as the console script has it, '__main__' as the
+    script launch (the fleet's) has it."""
+    if where == '__main__':
+        with mock.patch.object(sys.modules['__main__'], 'Terminate', Terminate, create=True):
+            yield
+        return
+    if 'weewxd' in sys.modules:           # the real one, imported by a test
+        with mock.patch.object(sys.modules['weewxd'], 'Terminate', Terminate, create=True):
+            yield
+        return
+    module = types.ModuleType('weewxd')
+    setattr(module, 'Terminate', Terminate)
+    sys.modules['weewxd'] = module
+    try:
+        yield
+    finally:
+        del sys.modules['weewxd']
 
 VALID_PKT: Dict[str, Any] = {
     "SensorId":"44:17:93:1:9d:3",
@@ -295,6 +331,27 @@ class TestCheckType(unittest.TestCase):
         ok, reason = user.purple.check_type({'a': True}, int, ['a'])
         self.assertFalse(ok, reason)
 
+    def test_nan_and_infinity_never_acceptable(self):
+        """Python's JSON parser turns NaN and Infinity into floats, and the
+        EPA correction and the AQI raise on (or are poisoned by) them."""
+        for bad in (float('nan'), float('inf'), float('-inf')):
+            with self.subTest(value=bad):
+                ok, reason = user.purple.check_type({'a': bad}, float, ['a'])
+                self.assertFalse(ok)
+                self.assertEqual(reason, 'a is not a finite number: %s' % bad)
+
+    def test_an_int_too_large_for_a_float_never_acceptable(self):
+        """JSON integers have no size limit, and one past a float's range
+        raises OverflowError in float arithmetic -- for an int field too,
+        since humidity and temperature feed the EPA correction."""
+        for t in (float, int):
+            with self.subTest(type=t):
+                ok, reason = user.purple.check_type({'a': 10**400}, t, ['a'])
+                self.assertFalse(ok)
+                self.assertEqual(reason, 'a is too large for a float')
+        ok, reason = user.purple.check_type({'a': 10**300}, float, ['a'])
+        self.assertTrue(ok, reason)
+
     def test_wrong_type(self):
         ok, reason = user.purple.check_type({'a': 'nan'}, int, ['a'])
         self.assertFalse(ok)
@@ -335,6 +392,130 @@ class TestIsSane(unittest.TestCase):
         # Single sensor: no b-channel fields at all.
         ok, reason = user.purple.is_sane(a_only_pkt())
         self.assertTrue(ok, reason)
+
+    def test_non_finite_or_huge_readings_are_rejected(self):
+        """End to end through is_sane: a NaN concentration, and a humidity
+        too large for a float -- each of which would raise in the EPA
+        correction -- are turned away at the gate.  (The humidity is caught
+        by the type check, before its range is asked.)"""
+        for field, value in (('pm2_5_cf_1', float('nan')), ('pm2_5_cf_1_b', float('inf')),
+                             ('current_humidity', 10**400)):
+            with self.subTest(field=field):
+                bad_pkt = VALID_PKT.copy()
+                bad_pkt[field] = value
+                ok, reason = user.purple.is_sane(bad_pkt)
+                self.assertFalse(ok)
+                self.assertTrue(reason.startswith(field + ' is '), reason)
+
+    def test_a_concentration_above_the_ceiling_is_rejected(self):
+        """A finite but absurd concentration passes the type check, then
+        overflows when the EPA correction squares it.  Each PM field, on
+        either sensor, is turned away above PM_CEILING; one at the ceiling
+        is still a reading."""
+        for field in user.purple.PM_FIELDS + [n + '_b' for n in user.purple.PM_FIELDS]:
+            with self.subTest(field=field):
+                bad_pkt = VALID_PKT.copy()
+                bad_pkt[field] = 1e200
+                ok, reason = user.purple.is_sane(bad_pkt)
+                self.assertFalse(ok)
+                self.assertTrue(reason.startswith(field + ' is above 1000000'), reason)
+        at_ceiling = VALID_PKT.copy()
+        for field in ('pm2_5_cf_1', 'pm2_5_cf_1_b'):
+            at_ceiling[field] = user.purple.PM_CEILING
+        ok, reason = user.purple.is_sane(at_ceiling)
+        self.assertTrue(ok, reason)
+        # And at the ceiling it computes: no overflow in the correction.
+        self.assertGreater(AQI.compute_pm2_5_us_epa_correction(
+            user.purple.PM_CEILING, user.purple.PM_CEILING, 40, 70), 0)
+
+    def test_a_b_field_is_checked_without_pm2_5_aqi_b(self):
+        """get_concentrations and the archive-record builder take each _b
+        field that is present, whether or not pm2.5_aqi_b came with it, so
+        each one present is checked the same way.  A reading that carries
+        a single sane _b field is still a reading."""
+        def channel_a_only(**b_fields):
+            pkt = {k: v for k, v in VALID_PKT.items()
+                   if not k.endswith('_b') and k not in ('pm2.5_aqi_b', 'p25aqic_b')}
+            pkt.update(b_fields)
+            return pkt
+        for field, value, reason in (
+                ('pm2_5_cf_1_b', 1e300, 'pm2_5_cf_1_b is above 1000000: 1e+300'),
+                ('pm1_0_atm_b', float('nan'), 'pm1_0_atm_b is not a finite number: nan'),
+                ('pm10_0_atm_b', -5.0, 'pm10_0_atm_b is negative: -5.0'),
+                ('p_0_3_um_b', 'x', "p_0_3_um_b is not an instance of <class 'float'>: x")):
+            with self.subTest(field=field):
+                ok, got = user.purple.is_sane(channel_a_only(**{field: value}))
+                self.assertFalse(ok)
+                self.assertEqual(got, reason)
+        ok, got = user.purple.is_sane(channel_a_only(pm1_0_atm_b=3.0))
+        self.assertTrue(ok, got)
+
+    def test_the_sensors_must_agree_without_pm2_5_aqi_b(self):
+        """A channel B that disagrees wildly with channel A is turned away
+        whether or not pm2.5_aqi_b came with it -- otherwise 5 and 500 were
+        averaged into a pm2_5 near 131 (AQI about 200) -- and on the atm
+        fields that pm1_0 and pm10_0 are averaged from, too."""
+        pkt = {k: v for k, v in VALID_PKT.items()
+               if not k.endswith('_b') and k not in ('pm2.5_aqi_b', 'p25aqic_b')}
+        for field in user.purple.AGREEMENT_FIELDS:
+            with self.subTest(field=field):
+                bad_pkt = dict(pkt)
+                bad_pkt[field] = 5.0
+                bad_pkt[field + '_b'] = 500.0
+                ok, reason = user.purple.is_sane(bad_pkt)
+                self.assertFalse(ok)
+                self.assertEqual(reason, 'Sensors disagree wildly for %s (5.000000, 500.000000)' % field)
+        full = VALID_PKT.copy()
+        full['pm10_0_atm_b'] = full['pm10_0_atm'] * 30 + 20
+        ok, reason = user.purple.is_sane(full)
+        self.assertFalse(ok)
+        self.assertTrue(reason.startswith('Sensors disagree wildly for pm10_0_atm '), reason)
+
+    def test_a_second_channel_must_be_whole(self):
+        """A sensor that reports pm2.5_aqi_b must report every channel-B
+        field; the message is the one a missing field has always given."""
+        bad_pkt = VALID_PKT.copy()
+        del bad_pkt['p_0_5_um_b']
+        ok, reason = user.purple.is_sane(bad_pkt)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "check_type: could not find key: 'p_0_5_um_b'")
+        bad_pkt = VALID_PKT.copy()
+        bad_pkt['pm2.5_aqi_b'] = 21.5
+        ok, reason = user.purple.is_sane(bad_pkt)
+        self.assertFalse(ok)
+
+    def test_a_negative_concentration_is_rejected(self):
+        """The sensor cannot count fewer than no particles.  Each PM field,
+        on either sensor, is turned away below 0; 0 itself is a reading."""
+        for field in user.purple.PM_FIELDS + [n + '_b' for n in user.purple.PM_FIELDS]:
+            with self.subTest(field=field):
+                bad_pkt = VALID_PKT.copy()
+                bad_pkt[field] = -3.0
+                ok, reason = user.purple.is_sane(bad_pkt)
+                self.assertFalse(ok)
+                self.assertEqual(reason, '%s is negative: -3.0' % field)
+        clean = VALID_PKT.copy()
+        for field in user.purple.PM_FIELDS + [n + '_b' for n in user.purple.PM_FIELDS]:
+            clean[field] = 0.0
+        ok, reason = user.purple.is_sane(clean)
+        self.assertTrue(ok, reason)
+
+    def test_humidity_outside_0_to_100_is_rejected(self):
+        """Relative humidity feeds the EPA correction; a garbage value drives
+        the corrected pm2_5 to 0, which would be stored as clean air."""
+        for humidity in (-1, 101, 10**20):
+            with self.subTest(humidity=humidity):
+                bad_pkt = VALID_PKT.copy()
+                bad_pkt['current_humidity'] = humidity
+                ok, reason = user.purple.is_sane(bad_pkt)
+                self.assertFalse(ok)
+                self.assertEqual(reason, 'current_humidity is outside 0 to 100: %s' % humidity)
+        for humidity in (0, 100):
+            with self.subTest(humidity=humidity):
+                good_pkt = VALID_PKT.copy()
+                good_pkt['current_humidity'] = humidity
+                ok, reason = user.purple.is_sane(good_pkt)
+                self.assertTrue(ok, reason)
 
     def test_missing_datetime(self):
         bad_pkt = VALID_PKT.copy()
@@ -579,11 +760,48 @@ class TestTerminatePassThrough(unittest.TestCase):
     whatever the main thread is executing.  The broad exception handlers on
     main-thread paths must hand it back."""
 
+    def setUp(self):
+        running = weewxd_running()
+        running.__enter__()
+        self.addCleanup(running.__exit__, None, None, None)
+
     def test_reraise_if_terminate(self):
         with self.assertRaises(Terminate):
             user.purple.reraise_if_terminate(Terminate())
         # Any other exception is not re-raised.
         self.assertIsNone(user.purple.reraise_if_terminate(ValueError()))
+
+    def test_the_shutdown_is_the_running_weewxds_terminate(self):
+        """Asked of the running weewxd's class, as a script (__main__) or
+        the console script (weewxd); a subclass is still the shutdown, and
+        a different class that is merely NAMED Terminate is not."""
+        for where in ('__main__', 'weewxd'):
+            with self.subTest(where=where), weewxd_running(where):
+                with self.assertRaises(Terminate):
+                    user.purple.reraise_if_terminate(type('Subclass', (Terminate,), {})())
+                self.assertIsNone(user.purple.reraise_if_terminate(Impostor()))
+                self.assertIsNone(user.purple.reraise_if_terminate(ValueError('Terminate')))
+
+    def test_nothing_is_the_shutdown_with_no_weewxd_running(self):
+        """weectl report run, or a test with no weewxd: nothing raises it."""
+        self.doCleanups()     # leave the weewxd setUp installed
+        if 'weewxd' in sys.modules:
+            self.skipTest('the real weewxd is loaded in this run')
+        self.assertIsNone(user.purple.reraise_if_terminate(Terminate()))
+
+    def test_the_installed_weewxds_terminate_is_the_shutdown(self):
+        """Against the real thing, not the stand-in: the venv's weewxd,
+        imported, defines the class weewxd's main loop catches, and
+        reraise_if_terminate re-raises it.  A WeeWX release that moved or
+        renamed the class would otherwise return the extension to swallowing
+        SIGTERM with every other test green."""
+        self.doCleanups()     # drop the stand-in; ask the real weewxd
+        import weewxd
+        self.assertIs(sys.modules['weewxd'], weewxd)
+        self.assertTrue(issubclass(weewxd.Terminate, Exception))
+        with self.assertRaises(weewxd.Terminate):
+            user.purple.reraise_if_terminate(weewxd.Terminate())
+        self.assertIsNone(user.purple.reraise_if_terminate(Terminate()))
 
     def test_collect_data_passes_terminate_through(self):
         with mock.patch('user.purple.requests.get', side_effect=Terminate()):
@@ -684,6 +902,18 @@ class TestGetConcentrations(unittest.TestCase):
         self.assertEqual(c.pm10_0, 5.0)    # (4 + 6) / 2
         self.assertEqual(c.pm2_5_cf_1, 3.0)    # cf_1 channels are NOT averaged here;
         self.assertEqual(c.pm2_5_cf_1_b, 5.0)  # the EPA correction averages them.
+
+    def test_a_partial_b_channel_is_taken_field_by_field(self):
+        """populate_record copies the _b fields one by one, so a record can
+        carry pm1_0_atm_b without pm2_5_cf_1_b.  This runs on the main thread
+        at startup, where a KeyError would stop weewxd from starting."""
+        cfg = make_cfg(sources=[make_source()])
+        record = self.fresh_record(pm1_0_atm_b=4.0)
+        with mock.patch('user.purple.collect_data', return_value=record):
+            c = user.purple.get_concentrations(cfg)
+        self.assertEqual(c.pm1_0, 3.0)       # (2 + 4) / 2
+        self.assertEqual(c.pm10_0, 4.0)      # no pm10_0_atm_b: A alone
+        self.assertIsNone(c.pm2_5_cf_1_b)    # no pm2_5_cf_1_b
 
     def test_disabled_source_skipped(self):
         s1 = make_source('Sensor1', enable=False, hostname='s1')
@@ -940,7 +1170,8 @@ class TestFetchProxyArchiveRecords(unittest.TestCase):
 
     def test_terminate_passes_through(self):
         # A main-thread path: weewxd's shutdown must not be swallowed.
-        with mock.patch('user.purple.requests.get', side_effect=Terminate('shutdown')):
+        with weewxd_running(), \
+             mock.patch('user.purple.requests.get', side_effect=Terminate('shutdown')):
             with self.assertRaises(Terminate):
                 user.purple.fetch_proxy_archive_records(self.source, 1000, 1300)
 
@@ -1223,7 +1454,8 @@ class TestNewArchiveRecord(unittest.TestCase):
     def test_terminate_is_not_swallowed_by_that_guard(self):
         end_ts = int(time.time()) - 86400
         record = self.make_record(end_ts)
-        with mock.patch.object(self.p, 'backfill_values',
+        with weewxd_running(), \
+             mock.patch.object(self.p, 'backfill_values',
                                side_effect=Terminate('shutdown')):
             with self.assertRaises(Terminate):
                 self.p.new_archive_record(types.SimpleNamespace(record=record))
@@ -1282,6 +1514,30 @@ class TestPurpleInit(unittest.TestCase):
         finally:
             # Unregister anything this test added to the global xtypes list
             # and the global accumulator config.
+            del weewx.xtypes.xtypes[0:len(weewx.xtypes.xtypes) - n_xtypes]
+            weewx.accum.accum_dict.maps[:] = orig_accum_maps
+
+    def test_a_second_engine_registers_nothing_more(self):
+        """After some errors weewxd builds a new engine, and so a new Purple,
+        in the same process.  The xtype list and the accumulator config are
+        module globals that outlive the engine, so the second Purple must
+        add neither another AQI nor another extractor map."""
+        engine = mock.Mock()
+        engine.console.archive_interval = 300
+        config = {'Purple': {'Sensor1': {'enable': True, 'hostname': 'sensor1'}}}
+        n_xtypes = len(weewx.xtypes.xtypes)
+        orig_accum_maps = list(weewx.accum.accum_dict.maps)
+        try:
+            with mock.patch('user.purple.get_concentrations', return_value=None), \
+                 mock.patch('user.purple.threading.Thread'):
+                Purple(engine, config)
+                n_maps = len(weewx.accum.accum_dict.maps)
+                Purple(engine, config)
+            self.assertEqual(
+                sum(isinstance(xtype, AQI) for xtype in weewx.xtypes.xtypes), 1)
+            self.assertEqual(len(weewx.xtypes.xtypes), n_xtypes + 1)
+            self.assertEqual(len(weewx.accum.accum_dict.maps), n_maps)
+        finally:
             del weewx.xtypes.xtypes[0:len(weewx.xtypes.xtypes) - n_xtypes]
             weewx.accum.accum_dict.maps[:] = orig_accum_maps
 
@@ -1465,6 +1721,24 @@ class TestAccumulatorExtractors(unittest.TestCase):
 
 class TestGetScalar(unittest.TestCase):
 
+    def test_another_type_is_refused_before_any_logging(self):
+        """First in the xtype chain, get_scalar sees every scalar lookup on
+        the station, so a type it does not serve is refused before anything
+        else -- not even a debug message is formatted."""
+        with mock.patch('user.purple.log') as log_mock:
+            with self.assertRaises(weewx.UnknownType):
+                AQI.get_scalar('outTemp', {'dateTime': 1700000000, 'usUnits': weewx.US})
+        log_mock.debug.assert_not_called()
+
+    def test_options_are_accepted(self):
+        """weewx.xtypes passes every xtype its option_dict.  Without it in
+        the signature the call raised TypeError and was retried without
+        it."""
+        record = {'dateTime': 1700000000, 'usUnits': weewx.US, 'pm2_5': 21.8}
+        self.assertEqual(AQI.get_scalar('pm2_5_aqi', record, None, week_start=6).value, 75)
+        with self.assertRaises(weewx.UnknownType):
+            AQI.get_scalar('outTemp', record, None, week_start=6)
+
     def test_aqi(self):
         record = {'dateTime': 1700000000, 'usUnits': weewx.US, 'pm2_5': 21.8}
         vt = AQI.get_scalar('pm2_5_aqi', record)
@@ -1501,6 +1775,19 @@ class TestGetScalar(unittest.TestCase):
             AQI.get_scalar('pm2_5_aqi', {'dateTime': 1700000000, 'pm2_5': 21.8})
 
 class TestGetSeries(unittest.TestCase):
+
+    def test_options_are_accepted_and_passed_on(self):
+        """weewx.xtypes passes every xtype its option_dict.  Without it in
+        the signature the call raised TypeError and was retried without it,
+        for every type, since this xtype is first in the chain.  An
+        aggregated series hands the options on to ArchiveTable."""
+        span = weeutil.weeutil.TimeSpan(0, 4000)
+        with self.assertRaises(weewx.UnknownType):
+            AQI.get_series('outTemp', span, None, week_start=6)
+        with mock.patch('weewx.xtypes.ArchiveTable.get_series') as archive_series:
+            AQI.get_series('pm2_5_aqi', span, 'db', 'avg', 3600, week_start=6)
+        archive_series.assert_called_once_with('pm2_5_aqi', span, 'db', 'avg', 3600,
+                                               week_start=6)
 
     def setUp(self):
         self.conn = sqlite3.connect(':memory:')
@@ -1679,6 +1966,32 @@ class TestGetAggregate(unittest.TestCase):
         self.assertEqual(
             AQI.get_aggregate('pm2_5_aqi', span, 'max', self.db_manager).value,
             AQI.compute_pm2_5_aqi(35.0))
+
+    def test_day_boundary_min_and_max_skip_a_day_with_no_readings(self):
+        """A day whose records all have a NULL pm2_5 -- a catch-up day nothing
+        could fill -- leaves a summary row with min and max NULL.  The span's
+        min and max are still those of the days that have readings, for the
+        AQI and for its color.  (Taken as `ORDER BY min ASC LIMIT 1`, the
+        NULL sorted first and the min came back None.)"""
+        day1 = self.local_midnight(2026, 1, 5)
+        day2 = self.local_midnight(2026, 1, 6)
+        day3 = self.local_midnight(2026, 1, 7)
+        self.conn.execute(
+            "INSERT INTO archive_day_pm2_5 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (day1, 5.0, day1 + 60, 25.0, day1 + 120, 1000.0, 100, 1000.0, 100))
+        self.conn.execute(
+            "INSERT INTO archive_day_pm2_5 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (day2, None, None, None, None, 0.0, 0, 0.0, 0))
+        self.insert_archive([(day1 + 300, 10.0)])
+        span = weeutil.weeutil.TimeSpan(day1, day3)
+        for obs_type, value in (('pm2_5_aqi', AQI.compute_pm2_5_aqi),
+                                ('pm2_5_aqi_color',
+                                 lambda pm: AQI.compute_pm2_5_aqi_color(AQI.compute_pm2_5_aqi(pm)))):
+            for agg, pm in (('min', 5.0), ('max', 25.0)):
+                with self.subTest(obs_type=obs_type, aggregate=agg):
+                    self.assertEqual(
+                        AQI.get_aggregate(obs_type, span, agg, self.db_manager).value,
+                        value(pm))
 
     def test_day_boundary_with_empty_archive_table(self):
         # Day summaries but no archive rows: the usUnits lookup finds no
@@ -1942,7 +2255,10 @@ class TestI18n(unittest.TestCase):
     REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     SKIN_DIR = os.path.join(REPO_DIR, 'skins', 'purple')
     LANG_DIR = os.path.join(SKIN_DIR, 'lang')
-    LANGUAGES = ['en', 'de', 'fr', 'nl', 'es']
+    LANGUAGES = ['en', 'de', 'fr', 'nl', 'es', 'da', 'it', 'no', 'sv']
+    # Seasons, which the shared vocabulary is pinned to, ships no Danish or
+    # Swedish; every other language here must have a Seasons original.
+    NOT_IN_SEASONS = {'da', 'sv'}
 
     @classmethod
     def lang_conf(cls, name: str) -> configobj.ConfigObj:
@@ -2139,6 +2455,13 @@ class TestI18n(unittest.TestCase):
         for lang in self.LANGUAGES:
             if lang == 'en':
                 continue
+            path = os.path.join(seasons_lang, lang + '.conf')
+            # Named, not skipped on a missing file: a blanket skip would stop
+            # pinning a language Seasons does ship.  And a name here that
+            # Seasons has since gained is stale, and fails.
+            self.assertEqual(os.path.exists(path), lang not in self.NOT_IN_SEASONS, lang)
+            if lang in self.NOT_IN_SEASONS:
+                continue
             seasons = configobj.ConfigObj(
                 os.path.join(seasons_lang, lang + '.conf'),
                 encoding='utf-8', file_error=True)
@@ -2299,6 +2622,378 @@ class TestSkinRendersOnEveryPython(unittest.TestCase):
                 except NotFound:
                     rendered = False
                 self.assertEqual(rendered, renders)
+
+
+# The station zone the DST tests run in, and how to enter and leave it.
+# past_spans itself never reads the zone; the shipped code it replaced did,
+# and the page's labels do.
+PACIFIC = 'America/Los_Angeles'
+
+def enter_zone(zone: str):
+    """Switch the process to `zone`; returns what restore_zone needs."""
+    saved = os.environ.get('TZ')
+    os.environ['TZ'] = zone
+    time.tzset()
+    return saved
+
+def restore_zone(saved) -> None:
+    """Put TZ back as it was -- deleted if it was unset, never set to ''
+    (which would leave the process on UTC)."""
+    if saved is None:
+        os.environ.pop('TZ', None)
+    else:
+        os.environ['TZ'] = saved
+    time.tzset()
+
+def utc(*fields) -> int:
+    """A UTC epoch.  Report times are named this way because a local time
+    in the repeated hour (01:10 on fall-back day) names two instants."""
+    return calendar.timegm(fields + (0,) * (6 - len(fields)))
+
+# Report times across both 2026-2027 clock changes in the Pacific zone.
+FALL_0110_PDT = utc(2026, 11, 1, 8, 10)     # first pass of the repeated hour
+FALL_0110_PST = utc(2026, 11, 1, 9, 10)     # second pass
+FALL_0310_PST = utc(2026, 11, 1, 11, 10)
+FALL_2330_PST = utc(2026, 11, 2, 7, 30)     # the day after, still affected
+SPRING_0305_PDT = utc(2027, 3, 14, 10, 5)
+SPRING_1005_PDT = utc(2027, 3, 14, 17, 5)
+SPRING_0230_PDT = utc(2027, 3, 15, 9, 30)   # the day after, still affected
+DST_REPORT_TIMES = (FALL_0110_PDT, FALL_0110_PST, FALL_0310_PST, FALL_2330_PST,
+                    SPRING_0305_PDT, SPRING_1005_PDT, SPRING_0230_PDT)
+
+
+class TestPastSpans(unittest.TestCase):
+    """past_spans: the sample report's hourly strip is the last 24 ELAPSED
+    hours.  It replaced $span($hour_delta=24)...series(aggregate_interval=
+    3600), whose window and buckets both stepped the wall clock: across a
+    clock change, 25 or 23 hours, a 7200 s bucket, and in the repeated hour
+    no newest hour at all.  Driven with a real TimespanBinder standing in
+    for $day, over an in-memory archive, the AQI xtype first in the chain
+    as Purple.__init__ puts it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.saved_zone = enter_zone(PACIFIC)
+
+    @classmethod
+    def tearDownClass(cls):
+        restore_zone(cls.saved_zone)
+
+    def setUp(self):
+        self.conn = sqlite3.connect(':memory:')
+        self.conn.execute(
+            "CREATE TABLE archive (dateTime INTEGER PRIMARY KEY, usUnits INTEGER, "
+            "`interval` INTEGER, pm2_5 REAL)")
+        self.manager = FakeDBManager(self.conn)
+        self.aqi = AQI()
+        weewx.xtypes.xtypes.insert(0, self.aqi)
+
+    def tearDown(self):
+        weewx.xtypes.xtypes.remove(self.aqi)
+        self.conn.close()
+
+    def fill(self, rows) -> None:
+        """Insert (dateTime, pm2_5) rows and set the archive's first and last
+        timestamps, as a manager opened over them would have them."""
+        self.conn.executemany("INSERT INTO archive VALUES (?, ?, ?, ?)",
+                              [(ts, weewx.US, 5, pm) for ts, pm in rows])
+        first, last = self.conn.execute(
+            "SELECT MIN(dateTime), MAX(dateTime) FROM archive").fetchone()
+        self.manager.first_timestamp = first
+        self.manager.last_timestamp = last
+
+    def day(self, report_time: int) -> weewx.tags.TimespanBinder:
+        """What the template passes as $day: the day's binder, whose
+        database lookup reaches this archive."""
+        return weewx.tags.TimespanBinder(
+            weeutil.weeutil.archiveDaySpan(report_time),
+            lambda binding=None: self.manager, None, 'day')
+
+    def steady_archive(self, report_time: int, hours: int = 30) -> None:
+        """Five-minute records with pm2_5 9.0 (AQI 50) from `hours` before the
+        report time through it."""
+        self.fill((ts, 9.0) for ts in range(report_time - hours * 3600, report_time + 1, 300))
+
+    def test_24_elapsed_hours_ending_at_the_report_time(self):
+        for report_time in DST_REPORT_TIMES:
+            with self.subTest(report=weeutil.weeutil.timestamp_to_string(report_time)):
+                self.refill(report_time)
+                spans = past_spans(self.day(report_time), report_time, 24, 3600)
+                self.assertEqual(len(spans), 24)
+                for i, span in enumerate(spans):
+                    self.assertEqual(span.timespan.start, report_time - (24 - i) * 3600)
+                    self.assertEqual(span.timespan.stop, report_time - (23 - i) * 3600)
+                self.assertEqual(spans[-1].end.raw, report_time)
+
+    def refill(self, report_time: int) -> None:
+        """Replace the archive with steady_archive's, for another report time."""
+        self.conn.execute("DELETE FROM archive")
+        self.steady_archive(report_time)
+
+    def test_records_at_both_ends_land_in_their_cells(self):
+        """A reading 60 s before the report time is in the NEWEST cell -- the
+        hour the shipped code dropped in the repeated hour -- and one 60 s
+        into the window is in the oldest."""
+        for report_time in DST_REPORT_TIMES:
+            with self.subTest(report=weeutil.weeutil.timestamp_to_string(report_time)):
+                self.conn.execute("DELETE FROM archive")
+                self.fill([(report_time - 30 * 3600, 9.0),          # the archive's start
+                           (report_time - 24 * 3600 + 60, 35.4),    # AQI 100
+                           (report_time - 60, 55.4),                # AQI 150
+                           (report_time, None)])                    # the report record
+                spans = past_spans(self.day(report_time), report_time, 24, 3600)
+                self.assertEqual(spans[0].pm2_5_aqi.avg.raw, 100)
+                self.assertEqual(spans[-1].pm2_5_aqi.avg.raw, 150)
+                self.assertEqual(spans[-1].pm2_5_aqi_color.avg.raw,
+                                 AQI.compute_pm2_5_aqi_color(150))
+                self.assertIsNone(spans[12].pm2_5_aqi.avg.raw)      # an hour with no data
+
+    def test_a_young_archive_gets_only_its_own_hours(self):
+        """The first record exactly 3 h before the report time: the span that
+        ENDS at it is left out, as WeeWX 5's get_series leaves out its
+        buckets, so 3 spans, not 4."""
+        report_time = FALL_0110_PST
+        self.fill((ts, 9.0) for ts in range(report_time - 3 * 3600, report_time + 1, 300))
+        spans = past_spans(self.day(report_time), report_time, 24, 3600)
+        self.assertEqual([s.timespan.stop for s in spans],
+                         [report_time - 7200, report_time - 3600, report_time])
+
+    def test_an_empty_archive_gets_none(self):
+        self.manager.first_timestamp = self.manager.last_timestamp = None
+        self.assertEqual(past_spans(self.day(FALL_0110_PST), FALL_0110_PST, 24, 3600), [])
+
+    def test_no_span_starts_after_the_last_record(self):
+        """A report time past the end of the archive (last record 5 h
+        before it): spans from the first that starts at or after the last
+        record are left out, so the newest ends at that record."""
+        report_time = FALL_0310_PST
+        self.fill((ts, 9.0) for ts in range(report_time - 30 * 3600,
+                                            report_time - 5 * 3600 + 1, 300))
+        spans = past_spans(self.day(report_time), report_time, 24, 3600)
+        self.assertEqual(len(spans), 19)
+        self.assertEqual(spans[-1].timespan.stop, report_time - 5 * 3600)
+
+    def test_spans_carry_days_formatting(self):
+        """The spans are built from $day's own formatter and converter and in
+        the 'day' context, so they format as $day (and $span) do."""
+        report_time = FALL_0110_PST
+        self.steady_archive(report_time)
+        day = self.day(report_time)
+        span = past_spans(day, report_time, 24, 3600)[0]
+        self.assertIs(span.formatter, day.formatter)
+        self.assertIs(span.converter, day.converter)
+        self.assertEqual(span.context, 'day')
+
+
+# The columns of WeeWX's wview_extended schema the sample report reads.  The
+# full schema costs a daily summary table per column (over a hundred), which
+# makes an archive take seconds to build.
+REPORT_COLUMNS = ('pm1_0', 'pm2_5', 'pm10_0')
+
+def make_archive(directory: str, records) -> dict:
+    """A real SQLite archive with daily summaries under `directory`, holding
+    REPORT_COLUMNS and `records`.  Returns the database dict."""
+    schema = {
+        'table': [('dateTime', 'INTEGER NOT NULL UNIQUE PRIMARY KEY'),
+                  ('usUnits', 'INTEGER NOT NULL'),
+                  ('interval', 'INTEGER NOT NULL')]
+                 + [(name, 'REAL') for name in REPORT_COLUMNS],
+        'day_summaries': [(name, 'scalar') for name in REPORT_COLUMNS],
+    }
+    db_dict = {'database_name': 'weewx.sdb', 'driver': 'weedb.sqlite',
+               'SQLITE_ROOT': directory}
+    with weewx.manager.DaySummaryManager.open_with_create(db_dict, schema=schema) as manager:
+        manager.addRecord(list(records), log_success=False)
+    return db_dict
+
+
+class TestSkinRender(unittest.TestCase):
+    """The sample report rendered by WeeWX's own report engine -- the path
+    weewxd's report thread and `weectl report run` take -- over real
+    archives, CheetahGenerator only (no plots are drawn), in the Pacific
+    zone.  This runs the template's own `#from user.purple import
+    past_spans` and its call, which nothing else in the suite executes.
+    (The import is a hit on the module this suite already loaded; weewxd's
+    sys.path setup is not exercised here.)
+
+    - fall: reported at 01:10 PST, the second pass of the repeated hour,
+      with pm2_5 missing for one hour.
+    - spring: reported at 10:05 PDT on spring-forward day, every hour AQI
+      100 (Moderate), German, with lang given as the locale-style spec
+      de.UTF-8.
+    - modifier: lang de@euro, a locale spec with a modifier and no country.
+    - locale: lang de_DE.UTF-8, with $lang handed over as written, as WeeWX
+      4.6-5.0 did."""
+
+    REPO_DIR = TestSkinCategoryTable.REPO_DIR
+
+    html: Dict[str, str] = {}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.saved_zone = enter_zone(PACIFIC)
+        cls.tmp = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls.tmp)
+        cls.aqi = AQI()
+        weewx.xtypes.xtypes.insert(0, cls.aqi)
+        gap = (FALL_0110_PST - 5 * 3600, FALL_0110_PST - 4 * 3600)
+        try:
+            cls.html = {
+                'fall': cls.render('fall', FALL_0110_PST, 'en',
+                                   lambda ts: None if gap[0] < ts <= gap[1] else 9.0),
+                'spring': cls.render('spring', SPRING_1005_PDT, 'de.UTF-8',
+                                     lambda ts: 35.4),
+                'modifier': cls.render('modifier', FALL_0310_PST, 'de@euro',
+                                       lambda ts: 9.0),
+            }
+            # WeeWX 4.6-5.0 handed $lang over exactly as written; 5.1's
+            # SkinInfo strips the country.  Stand in for the older ones.
+            unreduced = weewx.cheetahgenerator.SkinInfo.__init__
+            def as_written(self, generator):
+                unreduced(self, generator)
+                self.lang = generator.skin_dict.get('lang', 'en')
+            with mock.patch.object(weewx.cheetahgenerator.SkinInfo, '__init__', as_written):
+                cls.html['locale'] = cls.render('locale', FALL_0310_PST, 'de_DE.UTF-8',
+                                                lambda ts: 9.0)
+        finally:
+            weewx.xtypes.xtypes.remove(cls.aqi)
+            restore_zone(cls.saved_zone)
+
+    @classmethod
+    def render(cls, name: str, report_time: int, lang: str, pm2_5) -> str:
+        """Render index.html over half-hourly records from 26 h before
+        `report_time` through it, pm2_5 given by `pm2_5(ts)`."""
+        root = os.path.join(cls.tmp, name)
+        os.makedirs(root)
+        records = [dict(dateTime=ts, usUnits=weewx.US, interval=30,
+                        pm1_0=3.0, pm2_5=pm2_5(ts), pm10_0=12.0)
+                   for ts in range(report_time - 26 * 3600, report_time + 1, 1800)]
+        make_archive(root, records)
+        html_root = os.path.join(root, 'html')
+        config_dict = configobj.ConfigObj({
+            'WEEWX_ROOT': root,
+            'Station': {'location': 'Palo Alto', 'latitude': '37.4', 'longitude': '-122.1',
+                        'altitude': ['30', 'foot'], 'station_type': 'Simulator'},
+            'StdArchive': {'data_binding': 'wx_binding'},
+            'StdReport': {
+                'SKIN_ROOT': os.path.join(cls.REPO_DIR, 'skins'),
+                'HTML_ROOT': html_root,
+                'PurpleReport': {
+                    'skin': 'purple', 'enable': 'true', 'lang': lang,
+                    'HTML_ROOT': html_root,
+                    'Generators': {'generator_list': 'weewx.cheetahgenerator.CheetahGenerator'},
+                },
+            },
+            'DataBindings': {'wx_binding': {
+                'database': 'archive_sqlite', 'table_name': 'archive',
+                'manager': 'weewx.manager.DaySummaryManager',
+                'schema': 'weewx.schemas.wview_extended.schema'}},
+            'Databases': {'archive_sqlite': {'database_name': 'weewx.sdb',
+                                             'database_type': 'SQLite'}},
+            'DatabaseTypes': {'SQLite': {'driver': 'weedb.sqlite', 'SQLITE_ROOT': root}},
+        })
+        stn_info = weewx.station.StationInfo(**config_dict['Station'])
+        with weewx.manager.DBBinder(config_dict) as db_binder:
+            record = db_binder.get_manager('wx_binding').getRecord(report_time)
+        weewx.reportengine.StdReportEngine(
+            config_dict, stn_info, record=record, gen_ts=report_time).run(['PurpleReport'])
+        path = os.path.join(html_root, 'index.html')
+        if not os.path.exists(path):
+            return ''   # the template failed; each test says so in its own terms
+        with open(path, encoding='utf-8') as f:
+            return f.read()
+
+    def page(self, name: str) -> str:
+        html = self.html[name]
+        self.assertTrue(html, '%s: the template did not render (see the log)' % name)
+        return html
+
+    @staticmethod
+    def cell_titles(html: str) -> List[str]:
+        block = html.split('<div class="strip-cells">', 1)[1].split('</div>', 1)[0]
+        return [html_module.unescape(t) for t in re.findall(r'title="([^"]*)"', block)]
+
+    @staticmethod
+    def axis(html: str) -> List[str]:
+        block = html.split('<div class="strip-axis">', 1)[1].split('</div>', 1)[0]
+        return re.findall(r'<span>([^<]*)</span>', block)
+
+    def test_fall_back_strip_is_24_hours_with_the_newest_hour(self):
+        """01:10 PST: 24 cells, the newest ending at the report time, and the
+        clock's 01:10 twice, in the two adjacent newest cells.  The shipped
+        code gave 24 cells whose newest ended at 01:10 PDT -- an hour early."""
+        titles = self.cell_titles(self.page('fall'))
+        self.assertEqual(len(titles), 24)
+        self.assertEqual([t[:5] for t in titles[-2:]], ['01:10', '01:10'])
+        self.assertEqual(titles[-1], '01:10: 50 AQI')
+        self.assertEqual(titles[0][:5], '03:10')    # 23 elapsed h back: 03:10 PDT the day before
+
+    def test_an_hour_with_no_data_is_a_gray_cell_in_place(self):
+        """pm2_5 missing for the hour ending 4 elapsed hours before the
+        report: that cell is gray and carries only its time, and every other
+        cell has its AQI.  Four hours before 01:10 PST is 22:10 PDT, since
+        the clock went back an hour in between."""
+        html = self.page('fall')
+        titles = self.cell_titles(html)
+        self.assertEqual(titles[19], '22:10')
+        self.assertEqual([i for i, t in enumerate(titles) if ':' not in t[5:]], [19])
+        self.assertIn('<span style="background:#e7ebef;" title="22:10"></span>', html)
+
+    def test_spring_forward_strip_is_24_hours(self):
+        """10:05 PDT on spring-forward day: 24 cells, 02:xx never appears, and
+        the first and last labels are both 10:05, a day apart."""
+        html = self.page('spring')
+        titles = self.cell_titles(html)
+        self.assertEqual(len(titles), 24)
+        self.assertFalse([t for t in titles if t.startswith('02:')])
+        self.assertEqual(self.axis(html), ['10:05', '18:05', '03:05', '10:05'])
+
+    def test_the_hours_above_good_tile_counts_24_hours(self):
+        """Every hour reads AQI 100, above Good, and the tile counts the
+        strip's cells: 24 on spring-forward day, where the shipped code
+        counted 23."""
+        self.assertIn('<div class="v">24</div>', self.page('spring'))
+
+    def test_html_lang_is_the_language_alone(self):
+        """WeeWX finds the lang FILE for a spec like de.UTF-8 (it strips the
+        encoding), but passes $lang through with the encoding or modifier
+        still on it -- and before 5.1 with the country too (de_DE.UTF-8).
+        None is a valid BCP 47 tag; the page's lang attribute must be the
+        bare language."""
+        self.assertIn('<html lang="en">', self.page('fall'))
+        self.assertIn('<html lang="de">', self.page('spring'))     # the encoding, on this WeeWX
+        self.assertIn('<html lang="de">', self.page('modifier'))   # the modifier, on this WeeWX
+        self.assertIn('<html lang="de">', self.page('locale'))     # the country, on 4.6-5.0
+
+    def test_only_weewxs_own_columns_are_assumed(self):
+        """What make_archive's trimmed schema stands in for: every column it
+        builds is in WeeWX's own schema."""
+        import weewx.schemas.wview_extended as wview_extended
+        names = {name for name, _ in wview_extended.schema['table']}
+        self.assertTrue(set(REPORT_COLUMNS) <= names)
+
+
+class TestNoWallClockSpans(unittest.TestCase):
+    """No template in the skin builds a trailing window or buckets on the
+    wall clock: $span(...), .series(...) with aggregate_interval, and
+    .spans(...) all step it (weeutil's archiveSpanSpan and intervalgen), so
+    they come out 23 or 25 hours across a clock change.  The strip uses
+    past_spans instead.  Comment lines are stripped first, because the
+    template's own prose names what it avoids."""
+
+    SKIN_DIR = os.path.join(TestSkinCategoryTable.REPO_DIR, 'skins', 'purple')
+
+    def test_no_wall_clock_spans_in_the_templates(self):
+        templates = [name for name in os.listdir(self.SKIN_DIR)
+                     if name.endswith(('.tmpl', '.inc'))]
+        self.assertTrue(templates)
+        for name in templates:
+            with open(os.path.join(self.SKIN_DIR, name), encoding='utf-8') as f:
+                code = '\n'.join(line for line in f.read().splitlines()
+                                 if not line.lstrip().startswith('##'))
+            for banned in ('$span(', '.series(', 'aggregate_interval', '.spans('):
+                with self.subTest(template=name, banned=banned):
+                    self.assertNotIn(banned, code)
 
 
 class TestWeewxVersionFloor(unittest.TestCase):

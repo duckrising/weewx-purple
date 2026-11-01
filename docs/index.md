@@ -110,8 +110,9 @@ Day/Week/Month/Year tabs at the foot of the page:
 *Shown on 09/11/2020, the day wildfire smoke turned the Bay Area sky
 orange.  Most days are green; this is the one the colors are for.*
 
-The page is translatable, and German, French, Dutch and Spanish ship with
-it — see [Translating (i18n)](i18n.md):
+The page is translatable, and German, French, Dutch, Spanish, Danish,
+Italian, Norwegian and Swedish ship with it — see
+[Translating (i18n)](i18n.md):
 
 ![The sample report in German](https://raw.githubusercontent.com/chaunceygardiner/weewx-purple/master/PurpleReport-de.png)
 

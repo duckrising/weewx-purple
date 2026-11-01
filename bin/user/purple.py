@@ -43,7 +43,7 @@ import weewx
 
 log = logging.getLogger(__name__)
 
-WEEWX_PURPLE_VERSION = "7.2.2"
+WEEWX_PURPLE_VERSION = "7.3"
 
 if sys.version_info[0] < 3 or (sys.version_info[0] == 3 and sys.version_info[1] < 7):
     raise weewx.UnsupportedFeature(
@@ -78,6 +78,7 @@ if not weewx_version_at_least((4, 6)):
 import weeutil.logger
 import weeutil.weeutil
 import weewx.accum
+import weewx.tags
 import weewx.units
 import weewx.xtypes
 
@@ -170,11 +171,19 @@ def reraise_if_terminate(e: BaseException) -> None:
     """weewxd stops by raising Terminate from its SIGTERM signal handler --
     inside whatever the main thread is executing at that instant.  Every
     broad exception handler on a main-thread path must call this first and
-    hand the exception back, or weewx cannot shut down.  weewxd runs as
-    __main__, so its Terminate class cannot be imported here and is
-    recognized by name."""
-    if type(e).__name__ == 'Terminate':
-        raise e
+    hand the exception back, or weewx cannot shut down.
+
+    Asked of the class weewxd's own main loop catches, as the running
+    weewxd defines it: in sys.modules['__main__'] when weewxd.py runs as a
+    script, in sys.modules['weewxd'] under the console script.  (Importing
+    weewxd here would run it again and make a third class.)  Not by name --
+    a library's class called Terminate is not the shutdown.  Where neither
+    module defines one (weectl report run) nothing can raise it, and
+    nothing is re-raised."""
+    for name in ('__main__', 'weewxd'):
+        cls = getattr(sys.modules.get(name), 'Terminate', None)
+        if isinstance(cls, type) and issubclass(cls, BaseException) and isinstance(e, cls):
+            raise e
 
 def compute_pm_values(concentrations: Concentrations) -> Dict[str, float]:
     """The pm values this extension contributes for a set of concentrations.
@@ -227,11 +236,17 @@ def get_concentrations(cfg: Configuration):
                     current_temp_f   = to_int(record['current_temp_f']),
                     current_humidity = to_int(record['current_humidity']),
                 )
-                # If there is a 'b' sensor, add it in and average the readings
+                # If there is a 'b' sensor, add it in and average the readings.
+                # Each b channel is taken only if that field is actually there:
+                # populate_record copies the _b fields one by one, and this runs
+                # on the main thread at startup, where a KeyError would stop
+                # weewxd from starting.
                 log.debug('get_concentrations: concentrations BEFORE averaging in b reading: %s' % concentrations)
                 if 'pm1_0_atm_b' in record:
                     concentrations.pm1_0        = (concentrations.pm1_0  + to_float(record['pm1_0_atm_b'])) / 2.0
+                if 'pm2_5_cf_1_b' in record:
                     concentrations.pm2_5_cf_1_b = to_float(record['pm2_5_cf_1_b'])
+                if 'pm10_0_atm_b' in record:
                     concentrations.pm10_0       = (concentrations.pm10_0 + to_float(record['pm10_0_atm_b'])) / 2.0
                 log.debug('get_concentrations: concentrations: %s' % concentrations)
                 return concentrations
@@ -242,19 +257,58 @@ def check_type(j: Dict[str, Any], t, names: List[str]) -> Tuple[bool, str]:
     """Check that each named field in j is an instance of t.  JSON parses
     whole numbers as int, so int is also acceptable where float is expected.
     bool is never acceptable (JSON true/false parse as bool, a subclass of
-    int)."""
+    int).  Nor is NaN or Infinity, or an int too large for a float, all of
+    which Python's JSON parser accepts: every numeric field here reaches
+    float arithmetic (the EPA correction, the A/B comparison, the AQI), and
+    each of those raises or poisons it."""
     acceptable: Tuple[type, ...] = (float, int) if t is float else (t,)
     try:
         for name in names:
             x = j[name]
             if isinstance(x, bool) or not isinstance(x, acceptable):
                 return False, '%s is not an instance of %s: %s' % (name, t, j[name])
+            if isinstance(x, float) and not math.isfinite(x):
+                return False, '%s is not a finite number: %s' % (name, x)
+            if isinstance(x, int):
+                try:
+                    float(x)
+                except OverflowError:
+                    # Not printed: it can run to thousands of digits.
+                    return False, '%s is too large for a float' % name
         return True, ''
     except KeyError as e:
         return False, 'check_type: could not find key: %s' % e
     except Exception as e:
         reraise_if_terminate(e)
         return False, 'check_type: exception: %s' % e
+
+# A concentration above this is not a reading.  Real ones top out in the low
+# thousands of ug/m^3, even in wildfire smoke, and anything this size or
+# smaller computes safely; a finite value much larger overflows the EPA
+# correction (it squares the concentration) and so the AQI.  Nor is a
+# negative concentration a reading: the sensor cannot count fewer than no
+# particles, and a negative pm1_0 or pm10_0 would be stored as it came.
+PM_CEILING = 1_000_000.0
+PM_FIELDS = ['pm1_0_cf_1', 'pm1_0_atm', 'pm2_5_cf_1', 'pm2_5_atm', 'pm10_0_cf_1', 'pm10_0_atm']
+# Every float a sensor channel reports: the concentrations and two particle
+# counts.  Channel B's carry a _b suffix.
+CHANNEL_FLOAT_FIELDS = ['pm1_0_cf_1', 'pm1_0_atm', 'p_0_3_um', 'pm2_5_cf_1',
+                        'pm2_5_atm', 'p_0_5_um', 'pm10_0_cf_1', 'pm10_0_atm']
+# The concentrations the two sensors must agree on: the three cf_1 fields
+# first, in the order they have always been checked, then the atm fields
+# that pm1_0 and pm10_0 are averaged from.
+AGREEMENT_FIELDS = ['pm2_5_cf_1', 'pm1_0_cf_1', 'pm10_0_cf_1',
+                    'pm2_5_atm', 'pm1_0_atm', 'pm10_0_atm']
+
+def check_pm_range(j: Dict[str, Any], names: List[str]) -> Tuple[bool, str]:
+    """Check that each named concentration in j is from 0 to PM_CEILING.
+    Run after check_type, so each is already a finite number."""
+    for name in names:
+        if j[name] < 0:
+            return False, '%s is negative: %s' % (name, j[name])
+        if j[name] > PM_CEILING:
+            return False, '%s is above %d: %s' % (name, PM_CEILING, j[name])
+    return True, ''
 
 def exhibits_twenty_fold_delta(val_1: float, val_2: float) -> bool:
     # If either value is zero, skip this check.
@@ -291,36 +345,51 @@ def is_sane(j: Dict[str, Any]) -> Tuple[bool, str]:
     ok, reason = check_type(j, int, ['current_temp_f','current_humidity','current_dewpoint_f'])
     if not ok:
         return False, reason
+    # Relative humidity feeds the EPA correction, and one outside 0-100 is not
+    # a reading: a huge one drives the corrected pm2_5 to 0, which would be
+    # stored as a real, clean-air value.
+    if not 0 <= j['current_humidity'] <= 100:
+        return False, 'current_humidity is outside 0 to 100: %s' % j['current_humidity']
 
     ok, reason = check_type(j, float, ['pressure'])
     if not ok:
         return False, reason
 
     # Sensor A
-    ok, reason = check_type(j, float, ['pm1_0_cf_1','pm1_0_atm','p_0_3_um','pm2_5_cf_1',
-            'pm2_5_atm','p_0_5_um','pm10_0_cf_1','pm10_0_atm'])
+    ok, reason = check_type(j, float, CHANNEL_FLOAT_FIELDS)
     if not ok:
         return False, reason
     ok, reason = check_type(j, int, ['pm2.5_aqi'])
     if not ok:
         return False, reason
+    ok, reason = check_pm_range(j, PM_FIELDS)
+    if not ok:
+        return False, reason
 
-    # Sensor B
+    # Sensor B.  What uses channel B takes each _b field that is there, with
+    # or without pm2.5_aqi_b (get_concentrations and the archive-record
+    # builder both do), so each _b field present is checked on its own.
+    ok, reason = check_type(j, float, [name + '_b' for name in CHANNEL_FLOAT_FIELDS if name + '_b' in j])
+    if not ok:
+        return False, reason
+    ok, reason = check_pm_range(j, [name + '_b' for name in PM_FIELDS if name + '_b' in j])
+    if not ok:
+        return False, reason
+    # The sensors must agree on every concentration both report, again with
+    # or without pm2.5_aqi_b: a channel B far from channel A would otherwise
+    # be averaged into the stored value.
+    for name in AGREEMENT_FIELDS:
+        if name + '_b' in j and exhibits_twenty_fold_delta(j[name], j[name + '_b']):
+            return False, 'Sensors disagree wildly for %s (%f, %f)' % (name, j[name], j[name + '_b'])
+    # A sensor that reports a second channel (pm2.5_aqi_b) must report all of
+    # it.  Its values were checked above; here, only that each is there.
     if 'pm2.5_aqi_b' in j:
-        ok, reason = check_type(j, float, ['pm1_0_cf_1_b','pm1_0_atm_b','p_0_3_um_b','pm2_5_cf_1_b',
-                'pm2_5_atm_b','p_0_5_um_b','pm10_0_cf_1_b','pm10_0_atm_b'])
-        if not ok:
-            return False, reason
+        for name in CHANNEL_FLOAT_FIELDS:
+            if name + '_b' not in j:
+                return False, 'check_type: could not find key: %r' % (name + '_b')
         ok, reason = check_type(j, int, ['pm2.5_aqi_b'])
         if not ok:
             return False, reason
-        # Check on agreement between the sensors
-        if exhibits_twenty_fold_delta(j['pm2_5_cf_1'], j['pm2_5_cf_1_b']):
-            return False, 'Sensors disagree wildly for pm2_5_cf_1 (%f, %f)' % (j['pm2_5_cf_1'], j['pm2_5_cf_1_b'])
-        if exhibits_twenty_fold_delta(j['pm1_0_cf_1'], j['pm1_0_cf_1_b']):
-            return False, 'Sensors disagree wildly for pm1_0_cf_1 (%f, %f)' % (j['pm1_0_cf_1'], j['pm1_0_cf_1_b'])
-        if exhibits_twenty_fold_delta(j['pm10_0_cf_1'], j['pm10_0_cf_1_b']):
-            return False, 'Sensors disagree wildly for pm10_0_cf_1 (%f, %f)' % (j['pm10_0_cf_1'], j['pm10_0_cf_1_b'])
 
     return True, ''
 
@@ -416,9 +485,9 @@ def concentrations_from_archive_record(record: Dict[str, Any]) -> Concentrations
         current_humidity = to_int(record['current_humidity']),
     )
     # Each b channel is taken only if that field is actually there.  is_sane
-    # gates its b-channel checks on 'pm2.5_aqi_b', so a record can carry one _b
-    # field and not another and still be judged sane; this runs on the main
-    # thread, where a KeyError would stop weewxd.
+    # checks every _b field present, but a record can carry one _b field and
+    # not another and still be judged sane; this runs on the main thread,
+    # where a KeyError would stop weewxd.
     if 'pm1_0_atm_b' in record:
         concentrations.pm1_0        = (concentrations.pm1_0  + to_float(record['pm1_0_atm_b'])) / 2.0
     if 'pm2_5_cf_1_b' in record:
@@ -559,8 +628,13 @@ class Purple(StdService):
         if source_count == 0:
             log.error('No sources configured for purple extension.  Purple extension is inoperable.')
         else:
-            weewx.xtypes.xtypes.insert(0, AQI())
-            AQI.register_accumulator_extractors()
+            # Once per process: after some errors weewxd builds a new engine,
+            # and with it a new Purple, without restarting, while both
+            # registries are module globals that outlive the engine.  A second
+            # registration would only stack another AQI ahead of the first.
+            if not any(isinstance(xtype, AQI) for xtype in weewx.xtypes.xtypes):
+                weewx.xtypes.xtypes.insert(0, AQI())
+                AQI.register_accumulator_extractors()
 
             with self.cfg.lock:
                 self.cfg.concentrations = get_concentrations(self.cfg)
@@ -780,6 +854,49 @@ class DevicePoller:
             log.debug('poll_device: Sleeping for %d seconds.' % self.cfg.poll_secs)
             time.sleep(self.cfg.poll_secs)
 
+def past_spans(day, report_time, count, seconds):
+    """The last `count` spans of exactly `seconds` each, oldest first, the
+    newest ending at `report_time`, as TimespanBinders that answer the same
+    tags $day does ($h.pm2_5.avg, $h.end).
+
+    For a template's trailing-day strip:
+        #from user.<this module> import past_spans
+        #for $h in past_spans($day, $current.dateTime.raw, 24, 3600)
+    The function name takes no $, like any other name a template imports.
+
+    Not $span($hour_delta=24) with .series(aggregate_interval=3600): both
+    step the station's wall clock (weeutil's archiveSpanSpan and
+    intervalgen), so across a daylight-saving change the day runs 23 or 25
+    hours, one bucket can run two, and inside the repeated hour the newest
+    hour is dropped.  These spans are elapsed seconds, with no clock to
+    step.
+
+    `day` is used only for what it was built with -- database lookup,
+    binding, formatter, converter and options -- so the spans format and
+    convert exactly as $day does.  Spans outside the archive are left out by
+    the rule WeeWX 5's ArchiveTable.get_series applies to its buckets: none
+    that ends at or before the first record, none from the first that starts
+    at or after the last, and none at all from an empty archive.  A young
+    station therefore gets fewer than `count`.
+    """
+    manager = day.db_lookup(day.data_binding)
+    first_ts = manager.first_timestamp
+    last_ts = manager.last_timestamp
+    if first_ts is None or last_ts is None:
+        return []
+    spans = []
+    for back in range(count, 0, -1):
+        start = report_time - back * seconds
+        stop = start + seconds
+        if stop <= first_ts:
+            continue
+        if start >= last_ts:
+            break
+        spans.append(weewx.tags.TimespanBinder(
+            weeutil.weeutil.TimeSpan(start, stop), day.db_lookup, day.data_binding,
+            'day', day.formatter, day.converter, **day.option_dict))
+    return spans
+
 class AQI(weewx.xtypes.XType):
     """
     AQI XType which computes the AQI (air quality index) from
@@ -828,12 +945,15 @@ class AQI(weewx.xtypes.XType):
         'usUnits': "SELECT usUnits from %(table_name)s ORDER BY dateTime DESC LIMIT 1;",
         'avg'    : "SELECT sum(wsum) / sum(sumtime) FROM %(table_name)s%(pm2_5_summary_suffix)s "
                    "WHERE dateTime >= %(start)s AND dateTime < %(stop)s ",
-        'min'    : "SELECT min FROM %(table_name)s%(pm2_5_summary_suffix)s "
-                   "WHERE dateTime >= %(start)s AND dateTime < %(stop)s "
-                   "ORDER BY min ASC LIMIT 1;",
-        'max'    : "SELECT max FROM %(table_name)s%(pm2_5_summary_suffix)s "
-                   "WHERE dateTime >= %(start)s AND dateTime < %(stop)s "
-                   "ORDER BY max DESC LIMIT 1;",
+        # MIN(min), not ORDER BY min ASC LIMIT 1: a day whose records all
+        # have a NULL pm2_5 leaves a summary row whose min is NULL, and NULL
+        # sorts first ascending, so the ordered min query answered None for
+        # the whole span.  MIN skips NULLs.  (The descending max query sorted
+        # NULL last and was right; MAX(max) is for symmetry.)
+        'min'    : "SELECT MIN(min) FROM %(table_name)s%(pm2_5_summary_suffix)s "
+                   "WHERE dateTime >= %(start)s AND dateTime < %(stop)s;",
+        'max'    : "SELECT MAX(max) FROM %(table_name)s%(pm2_5_summary_suffix)s "
+                   "WHERE dateTime >= %(start)s AND dateTime < %(stop)s;",
     }
 
     @staticmethod
@@ -903,8 +1023,9 @@ class AQI(weewx.xtypes.XType):
         return val if val >= 0.0 else 0.0
 
     @staticmethod
-    def get_scalar(obs_type, record, db_manager=None):
-        log.debug('get_scalar(%s)' % obs_type)
+    def get_scalar(obs_type, record, db_manager=None, **option_dict):
+        # The type check comes first: at the front of the chain, every
+        # scalar lookup on the station passes through here.
         if obs_type not in [ 'pm2_5_aqi', 'pm2_5_aqi_color' ]:
             raise weewx.UnknownType(obs_type)
         log.debug('get_scalar(%s)' % obs_type)
@@ -938,8 +1059,14 @@ class AQI(weewx.xtypes.XType):
             raise weewx.CannotCalculate(obs_type)
 
     @staticmethod
-    def get_series(obs_type, timespan, db_manager, aggregate_type=None, aggregate_interval=None):
+    def get_series(obs_type, timespan, db_manager, aggregate_type=None, aggregate_interval=None,
+                   **option_dict):
         """Get a series, possibly with aggregation.
+
+        option_dict: what weewx.xtypes passes every xtype.  Without it in the
+        signature, each call that carried options raised TypeError, and
+        weewx.xtypes caught it and called again without them -- for every
+        type, since this xtype is first in the chain.
         """
 
         if obs_type not in [ 'pm2_5_aqi', 'pm2_5_aqi_color' ]:
@@ -958,7 +1085,7 @@ class AQI(weewx.xtypes.XType):
         if aggregate_type:
             # Yes. Just use the regular series function.
             return weewx.xtypes.ArchiveTable.get_series(obs_type, timespan, db_manager, aggregate_type,
-                                           aggregate_interval)
+                                           aggregate_interval, **option_dict)
         else:
             # No aggregation.
             sql_str = 'SELECT dateTime, usUnits, `interval`, pm2_5 FROM %s ' \

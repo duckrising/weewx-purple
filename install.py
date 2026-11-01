@@ -164,7 +164,7 @@ def loader():
 class PurpleInstaller(ExtensionInstaller):
     def __init__(self):
         super(PurpleInstaller, self).__init__(
-            version="7.2.2",
+            version="7.3",
             name='purple',
             description='Collect air quality readings from PurpleAir sensors (or purple-proxy).',
             author="John A Kline",
@@ -188,6 +188,10 @@ class PurpleInstaller(ExtensionInstaller):
                     'skins/purple/lang/fr.conf',
                     'skins/purple/lang/nl.conf',
                     'skins/purple/lang/es.conf',
+                    'skins/purple/lang/da.conf',
+                    'skins/purple/lang/it.conf',
+                    'skins/purple/lang/no.conf',
+                    'skins/purple/lang/sv.conf',
                 ]),
             ]
         )

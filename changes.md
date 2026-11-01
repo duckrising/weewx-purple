@@ -1,5 +1,56 @@
 # weewx-purple change history
 
+## 7.3 11/01/2026
+- The sample report ships in Danish, Italian, Norwegian (Bokmål) and
+  Swedish, as well as German, French, Dutch and Spanish: set `lang = da`,
+  `it`, `no` or `sv` on the report.  The Italian and Norwegian plot-period
+  tabs are WeeWX's own Seasons translations.  Corrections welcome -- file an
+  issue at https://github.com/chaunceygardiner/weewx-purple/issues.
+- The sample report's hourly strip covers the last 24 elapsed hours, one
+  cell per real hour, across a clock change.  It was built from 24
+  wall-clock hours, bucketed on the wall clock.  For a day after each
+  change, that gave a 25-hour strip with one two-hour cell in November and
+  23 cells in March.  In the repeated hour, the newest hour was missing.
+  The "Hours above Good" tile, which counts the cells, was off by the same
+  amount.  On fall-back day two adjacent cells now carry the same label
+  (the clock read that time twice).  For a day after spring-forward, the
+  strip's first and last labels match, a day apart.
+- On WeeWX 4.x, an hour with no data in the strip now shows as a gray cell
+  in its place, as it already did on WeeWX 5.  Before, the gap closed up and
+  the later cells shifted left.
+- A week, month or year minimum of `pm2_5_aqi` or `pm2_5_aqi_color` came
+  back empty when any day in the period had no PM2.5 readings at all (a
+  catch-up day nothing could fill).  It is now the minimum over the days that
+  have readings.
+- When weewxd rebuilds its engine without restarting (it does after some
+  errors), the AQI xtype is no longer registered a second time; each rebuild
+  used to stack another copy ahead of the first.  The xtype also accepts the
+  options WeeWX passes every xtype, so WeeWX no longer has to catch an error
+  and call again without them, and it refuses a type it does not serve
+  before doing anything else.
+- A reading carrying NaN, Infinity, or a number too large for a float in
+  any numeric field, or a PM concentration above 1,000,000 µg/m³, is
+  rejected as not sane.  Python's JSON parser accepts all of them, and each
+  would raise in the EPA correction or the AQI calculation.  Real readings
+  top out in the low thousands, even in wildfire smoke.
+- A reading with a negative PM concentration, or a relative humidity
+  outside 0 to 100, is rejected as not sane.  A garbage humidity drove the
+  corrected pm2_5 to 0, which was stored as a real clean-air reading, and a
+  negative pm1_0 or pm10_0 was stored as it came.  Each of these checks
+  covers the second sensor's fields too, whichever of them a reading
+  carries, and so does the check that the two sensors agree, which now
+  also covers the atm fields pm1_0 and pm10_0 are averaged from.
+- A reading carrying only some of the second sensor's fields no longer
+  stops WeeWX from starting: each is taken only if it is there.
+- Internal: weewxd's shutdown is recognized by the running weewxd's own
+  Terminate class rather than by the name Terminate, so another library's
+  class of that name can never be mistaken for it.
+- The sample report's `<html lang>` carries only the language.  A `lang`
+  written as a locale spec reached the page with its encoding or modifier
+  (`de.UTF-8`, `de@euro`), and before WeeWX 5.1 with its country too
+  (`de_DE.UTF-8`).  None is a valid language tag, so the page failed HTML
+  validation.
+
 ## 7.2.2 09/30/2026
 - A sensor is read by IP address rather than by name, as purple-proxy has
   done since 4.1.  A PurpleAir that has lost its WAN connection drops into

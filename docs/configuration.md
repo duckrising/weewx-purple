@@ -127,14 +127,15 @@ archive period, for as long as it stays down.
 ## The sample report
 
 The install also enables a `[[PurpleReport]]` entry under `[StdReport]`,
-rendered to `<HTML_ROOT>/purple`.  To render it in German, French, Dutch or
-Spanish, add a `lang` entry to its stanza — see
+rendered to `<HTML_ROOT>/purple`.  To render it in German, French, Dutch,
+Spanish, Danish, Italian, Norwegian or Swedish, add a `lang` entry to its
+stanza — see
 [Translating (i18n)](i18n.md):
 
 ```
 [StdReport]
     [[PurpleReport]]
-        lang = de                # or fr, nl, or es
+        lang = de                # or fr, nl, es, da, it, no or sv
 ```
 
 ## Customizing the sample report
