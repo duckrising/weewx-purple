@@ -116,6 +116,8 @@ weewx.units.obs_group_dict["pm2_5_aqi_color"] = "air_quality_color"
 weewx.units.obs_group_dict["pm2_5_cf_1"] = "group_concentration"
 weewx.units.obs_group_dict["pm2_5_cf_1_b"] = "group_concentration"
 weewx.units.obs_group_dict["purple_humidity"] = "group_percent"
+weewx.units.obs_group_dict["purple_temperature"] = "group_temperature"
+weewx.units.obs_group_dict["purple_dewpoint"] = "group_temperature"
 
 
 class Source:
@@ -843,6 +845,16 @@ class Purple(StdService):
                     event.packet["purple_humidity"] = (
                         self.cfg.concentrations.current_humidity
                     )
+                c = self.cfg.concentrations
+                for name, value in (
+                    ("purple_temperature", c.current_temp_f),
+                    ("purple_dewpoint", c.current_dewpoint_f),
+                ):
+                    if value is not None:
+                        event.packet[name] = weewx.units.convertStd(
+                            (value, "degree_F", "group_temperature"),
+                            event.packet["usUnits"],
+                        )[0]
                 self.record_injections(event.packet, values)
                 if "pm2_5" in event.packet:
                     event.packet["pm2_5_aqi"] = AQI.compute_pm2_5_aqi(
