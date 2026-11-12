@@ -150,6 +150,7 @@ class Concentrations:
     pm2_5_cf_1_b: Optional[float]
     current_temp_f: int
     current_humidity: int
+    current_dewpoint_f: int
 
 
 # The observations this extension contributes to loop packets and, when a
@@ -264,6 +265,7 @@ def get_concentrations(cfg: Configuration):
                     pm2_5_cf_1_b=None,  # If there is a second sensor, this will be updated below.
                     current_temp_f=to_int(record["current_temp_f"]),
                     current_humidity=to_int(record["current_humidity"]),
+                    current_dewpoint_f=to_int(record["current_dewpoint_f"]),
                 )
                 # If there is a 'b' sensor, add it in and average the readings.
                 # Each b channel is taken only if that field is actually there:
@@ -577,6 +579,7 @@ def concentrations_from_archive_record(record: Dict[str, Any]) -> Concentrations
         pm2_5_cf_1_b=None,  # If there is a second sensor, this will be updated below.
         current_temp_f=to_int(record["current_temp_f"]),
         current_humidity=to_int(record["current_humidity"]),
+        current_dewpoint_f=to_int(record["current_dewpoint_f"]),
     )
     # Each b channel is taken only if that field is actually there.  is_sane
     # checks every _b field present, but a record can carry one _b field and
